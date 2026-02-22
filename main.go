@@ -84,6 +84,7 @@ func main() {
 	registerProductRoutes(mux)
 	registerAPIRoutes(mux)
 	registerCartRoutes(mux)
+	registerOrderRoutes(mux)
 
 	handler := requestLogger(trace404Middleware(corsMiddleware(mux)))
 

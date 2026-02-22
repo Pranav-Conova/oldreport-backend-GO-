@@ -206,6 +206,28 @@ func (r *productRepository) migrate() error {
 			);`,
 			`CREATE INDEX IF NOT EXISTS idx_cart_items_cart_id ON cart_items(cart_id);`,
 			`CREATE INDEX IF NOT EXISTS idx_cart_items_product_size ON cart_items(product_id, size);`,
+			`CREATE TABLE IF NOT EXISTS orders (
+				id BIGSERIAL PRIMARY KEY,
+				user_id BIGINT NOT NULL REFERENCES custom_users(id) ON DELETE CASCADE,
+				address_id BIGINT REFERENCES addresses(id) ON DELETE SET NULL,
+				razorpay_order_id TEXT,
+				razorpay_payment_id TEXT,
+				razorpay_signature TEXT,
+				total_amount BIGINT,
+				consignment_number TEXT,
+				delivery_status TEXT NOT NULL DEFAULT 'pending',
+				created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			);`,
+			`CREATE TABLE IF NOT EXISTS order_items (
+				id BIGSERIAL PRIMARY KEY,
+				order_id BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+				product_id BIGINT REFERENCES products(id) ON DELETE SET NULL,
+				size TEXT NOT NULL,
+				quantity INTEGER,
+				price BIGINT
+			);`,
+			`CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at DESC);`,
+			`CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id);`,
 		}
 	} else {
 		queries = []string{
@@ -277,6 +299,32 @@ func (r *productRepository) migrate() error {
 			);`,
 			`CREATE INDEX IF NOT EXISTS idx_cart_items_cart_id ON cart_items(cart_id);`,
 			`CREATE INDEX IF NOT EXISTS idx_cart_items_product_size ON cart_items(product_id, size);`,
+			`CREATE TABLE IF NOT EXISTS orders (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				user_id INTEGER NOT NULL,
+				address_id INTEGER,
+				razorpay_order_id TEXT,
+				razorpay_payment_id TEXT,
+				razorpay_signature TEXT,
+				total_amount INTEGER,
+				consignment_number TEXT,
+				delivery_status TEXT NOT NULL DEFAULT 'pending',
+				created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				FOREIGN KEY(user_id) REFERENCES custom_users(id) ON DELETE CASCADE,
+				FOREIGN KEY(address_id) REFERENCES addresses(id) ON DELETE SET NULL
+			);`,
+			`CREATE TABLE IF NOT EXISTS order_items (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				order_id INTEGER NOT NULL,
+				product_id INTEGER,
+				size TEXT NOT NULL,
+				quantity INTEGER,
+				price INTEGER,
+				FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
+				FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE SET NULL
+			);`,
+			`CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at DESC);`,
+			`CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id);`,
 		}
 	}
 

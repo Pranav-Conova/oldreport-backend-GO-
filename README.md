@@ -15,6 +15,11 @@ Endpoints:
 - `POST /api/cart` adds an item to authenticated user's cart
 - `PUT /api/cart` updates quantity of an existing cart item
 - `DELETE /api/cart` removes an item from cart using `item_id`
+- `POST /api/create-order` creates a Razorpay order from cart
+- `POST /api/verify-payment` verifies Razorpay payment, creates order, decrements stock, clears cart
+- `GET /api/order-list` lists current authenticated user's orders
+- `GET /api/all-orders` lists all orders (manager only)
+- `PUT /api/all-orders/{order_id}` updates delivery status/consignment (manager only)
 - `GET /role` (or `/role/`) returns authenticated user's `username`, `email`, `role`
 - `GET /address` (or `/address/`) returns authenticated user's address
 - `POST /address` creates/updates authenticated user's address
@@ -49,6 +54,12 @@ Notes:
 - Cart endpoints require authentication
 - Cart `POST`/`PUT`/`DELETE` expect a JSON request body; invalid JSON returns:
   `{"error":"Invalid JSON body."}`
+- Order endpoints require authentication (`all-orders*` additionally require manager role)
+
+Razorpay env:
+
+- `RAZORPAY_KEY_ID` + `RAZORPAY_KEY_SECRET` (preferred), or
+- `RAZOR_PAY_API_KEY` + `RAZOR_PAY_API_SECRET` (also supported)
 Database:
 
 - `DB_BACKEND=sqlite` for testing (default), using `SQLITE_PATH=test.db`
