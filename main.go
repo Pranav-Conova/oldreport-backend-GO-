@@ -122,6 +122,14 @@ func main() {
 
 	handler := panicRecovery(requestLogger(trace404Middleware(corsMiddleware(bodyLimitMiddleware(mux)))))
 
+	// AWS_LAMBDA_FUNCTION_NAME is injected automatically by the Lambda runtime.
+	// When it is present we start the Lambda adapter instead of a plain HTTP server.
+	if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != "" {
+		log.Println("Starting in AWS Lambda mode")
+		startLambda(handler)
+		return
+	}
+
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           handler,
