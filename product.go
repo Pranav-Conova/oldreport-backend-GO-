@@ -66,42 +66,121 @@ type productRepository struct {
 }
 
 var (
-	repoOnce sync.Once
+	repoMu   sync.RWMutex
 	repoInst *productRepository
-	repoErr  error
 )
 
+// getProductRepository returns the singleton repository, reconnecting if the
+// underlying connection is no longer alive.  This is important on AWS Lambda
+// where warm instances may wake up with a stale pool after minutes of
+// inactivity — sync.Once would permanently return the broken connection.
 func getProductRepository() (*productRepository, error) {
-	repoOnce.Do(func() {
-		driver, dsn, dialect, err := resolveDBConfig()
-		if err != nil {
-			repoErr = err
-			return
+	// Fast path: connection exists and is healthy.
+	repoMu.RLock()
+	inst := repoInst
+	repoMu.RUnlock()
+	if inst != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := inst.db.PingContext(ctx); err == nil {
+			return inst, nil
 		}
-		db, err := sql.Open(driver, dsn)
-		if err != nil {
-			repoErr = err
-			return
-		}
-		if dialect == "sqlite" {
-			db.SetMaxOpenConns(1)
-			if _, err := db.Exec("PRAGMA foreign_keys = ON;"); err != nil {
-				repoErr = err
-				_ = db.Close()
-				return
-			}
-		}
+		// Ping failed — fall through to reconnect.
+		log.Printf("[db] ping failed on warm connection, reconnecting")
+	}
 
-		repoInst = &productRepository{db: db, dialect: dialect}
-		repoErr = repoInst.migrate()
-		if repoErr != nil {
+	// Slow path: (re)connect under write lock.
+	repoMu.Lock()
+	defer repoMu.Unlock()
+
+	// Double-check now that we hold the write lock.
+	if repoInst != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := repoInst.db.PingContext(ctx); err == nil {
+			return repoInst, nil
+		}
+		_ = repoInst.db.Close()
+		repoInst = nil
+	}
+
+	driver, dsn, dialect, err := resolveDBConfig()
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	applyPoolSettings(db, dialect)
+
+	if dialect == "sqlite" {
+		if _, err := db.Exec("PRAGMA foreign_keys = ON;"); err != nil {
 			_ = db.Close()
-			repoInst = nil
-			return
+			return nil, err
 		}
-	})
+	}
 
-	return repoInst, repoErr
+	// Verify connectivity immediately so callers get a meaningful error
+	// rather than a silent failure on the first query.
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := db.PingContext(pingCtx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("db connect failed: %w", err)
+	}
+
+	repo := &productRepository{db: db, dialect: dialect}
+	if err := repo.migrate(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	repoInst = repo
+	log.Printf("[db] connected (%s)", dialect)
+	return repoInst, nil
+}
+
+// applyPoolSettings configures database/sql pool limits appropriately for
+// the current runtime environment.
+func applyPoolSettings(db *sql.DB, dialect string) {
+	if dialect == "sqlite" {
+		// SQLite supports only one writer; serialise everything.
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		db.SetConnMaxLifetime(0)
+		return
+	}
+
+	if isLambda() {
+		// Lambda-specific pool: each instance handles ONE request at a time,
+		// so 2 open connections is ample.  With potentially hundreds of
+		// concurrent Lambda instances, a large pool per instance would
+		// exhaust Supabase's server-side connection limit instantly.
+		//
+		// ConnMaxLifetime=55s  — well under pgBouncer's 60s idle timeout;
+		//                        forces the driver to re-dial before the
+		//                        server closes the socket beneath us.
+		// ConnMaxIdleTime=20s  — release the connection if Lambda is idle
+		//                        between invocations so we don't hold slots
+		//                        open on Supabase for no reason.
+		db.SetMaxOpenConns(2)
+		db.SetMaxIdleConns(1)
+		db.SetConnMaxLifetime(55 * time.Second)
+		db.SetConnMaxIdleTime(20 * time.Second)
+		return
+	}
+
+	// Local / traditional long-running server.
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(4 * time.Minute)
+	db.SetConnMaxIdleTime(90 * time.Second)
+}
+
+func isLambda() bool {
+	return os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != ""
 }
 
 func resolveDBConfig() (driver string, dsn string, dialect string, err error) {
