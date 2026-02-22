@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -37,9 +38,36 @@ func trace404Middleware(next http.Handler) http.Handler {
 		next.ServeHTTP(lrw, r)
 		if lrw.statusCode == http.StatusNotFound {
 			log.Printf("404 trace: method=%s path=%s query=%s", r.Method, r.URL.Path, r.URL.RawQuery)
-			debug.PrintStack()
+			if isDebugMode() {
+				debug.PrintStack()
+			}
 		}
 	})
+}
+
+func panicRecovery(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rc := recover(); rc != nil {
+				log.Printf("panic recovered: %v\n%s", rc, debug.Stack())
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+func bodyLimitMiddleware(next http.Handler) http.Handler {
+	const maxBytes = 32 << 20 // 32 MB
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isDebugMode() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("DEBUG")))
+	return v == "1" || v == "true" || v == "yes"
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
@@ -47,16 +75,16 @@ func corsMiddleware(next http.Handler) http.Handler {
 		origin := r.Header.Get("Origin")
 		allowedOrigins := strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS"))
 
-		if allowedOrigins == "" {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-		} else {
+		if allowedOrigins != "" {
 			for _, o := range strings.Split(allowedOrigins, ",") {
 				if strings.TrimSpace(o) == origin {
 					w.Header().Set("Access-Control-Allow-Origin", origin)
+					w.Header().Add("Vary", "Origin")
 					break
 				}
 			}
 		}
+		// If CORS_ALLOWED_ORIGINS is not set, no origin is allowed (no header emitted).
 
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
@@ -76,6 +104,12 @@ func main() {
 	}
 	initJWKS()
 
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		port = "8080"
+	}
+	addr := ":" + port
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", healthHandler)
@@ -86,14 +120,34 @@ func main() {
 	registerCartRoutes(mux)
 	registerOrderRoutes(mux)
 
-	handler := requestLogger(trace404Middleware(corsMiddleware(mux)))
+	handler := panicRecovery(requestLogger(trace404Middleware(corsMiddleware(bodyLimitMiddleware(mux)))))
 
-	log.Println("Starting server on :8080")
-	log.Fatal(http.ListenAndServe(":8080", handler))
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	log.Printf("Starting server on %s", addr)
+	log.Fatal(srv.ListenAndServe())
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	repo, err := getProductRepository()
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "error", "detail": fmt.Sprintf("db init: %v", err)})
+		return
+	}
+	if err := repo.db.PingContext(r.Context()); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "error", "detail": "db unreachable"})
+		return
+	}
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 

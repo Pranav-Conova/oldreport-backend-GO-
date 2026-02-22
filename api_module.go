@@ -127,7 +127,7 @@ func userAddressHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if exists {
-			updated, err := updateAddressPartial(r.Context(), addr.ID, payload)
+			updated, err := updateAddressPartial(r.Context(), addr.ID, user.ID, payload)
 			if err != nil {
 				logErrorWithTrace("failed to update address", err)
 				writeJSON(w, http.StatusBadRequest, map[string]string{"detail": err.Error()})
@@ -313,7 +313,10 @@ func createAddress(ctx context.Context, userID int64, p addressPayload) (Address
 	return addr, nil
 }
 
-func updateAddressPartial(ctx context.Context, addressID int64, p addressPayload) (Address, error) {
+// updateAddressPartial applies a partial update to an address row. userID is
+// used in the WHERE clause as defence-in-depth so the query is a no-op if the
+// address belongs to a different user.
+func updateAddressPartial(ctx context.Context, addressID int64, userID int64, p addressPayload) (Address, error) {
 	repo, err := getProductRepository()
 	if err != nil {
 		return Address{}, err
@@ -343,10 +346,14 @@ func updateAddressPartial(ctx context.Context, addressID int64, p addressPayload
 		return getAddressByID(ctx, addressID)
 	}
 
-	args = append(args, addressID)
-	query := "UPDATE addresses SET " + strings.Join(sets, ", ") + " WHERE id = ?"
-	if _, err := repo.db.ExecContext(ctx, rebindQuery(query, repo.dialect), args...); err != nil {
+	args = append(args, addressID, userID)
+	query := "UPDATE addresses SET " + strings.Join(sets, ", ") + " WHERE id = ? AND user_id = ?"
+	res, err := repo.db.ExecContext(ctx, rebindQuery(query, repo.dialect), args...)
+	if err != nil {
 		return Address{}, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return Address{}, errors.New("address not found or access denied")
 	}
 
 	return getAddressByID(ctx, addressID)

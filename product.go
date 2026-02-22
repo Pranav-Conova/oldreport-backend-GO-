@@ -953,13 +953,44 @@ func parseStockDetails(r *http.Request) ([]productStockInput, error) {
 	ctype := r.Header.Get("Content-Type")
 
 	if strings.Contains(ctype, "application/json") {
-		var payload struct {
-			StockDetails []productStockInput `json:"stock_details"`
-		}
+		var payload map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			return nil, err
 		}
-		return payload.StockDetails, nil
+
+		raw, ok := payload["stock_details"]
+		if !ok || raw == nil {
+			return []productStockInput{}, nil
+		}
+
+		// Accept native JSON arrays: {"stock_details":[...]}
+		if arr, ok := raw.([]any); ok {
+			b, err := json.Marshal(arr)
+			if err != nil {
+				return nil, err
+			}
+			var stock []productStockInput
+			if err := json.Unmarshal(b, &stock); err != nil {
+				return nil, err
+			}
+			return stock, nil
+		}
+
+		// Accept stringified JSON arrays:
+		// {"stock_details":"[{\"size\":\"M\",\"quantity\":7}]"}
+		if s, ok := raw.(string); ok {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				return []productStockInput{}, nil
+			}
+			var stock []productStockInput
+			if err := json.Unmarshal([]byte(s), &stock); err != nil {
+				return nil, err
+			}
+			return stock, nil
+		}
+
+		return nil, errors.New("stock_details must be array or stringified array")
 	}
 
 	raw := strings.TrimSpace(r.FormValue("stock_details"))
@@ -1036,6 +1067,36 @@ func saveSingleImage(fileHeader *multipart.FileHeader) (string, error) {
 	return saveSingleImageLocal(fileHeader)
 }
 
+// allowedImageMIMEs is the set of MIME types accepted for product images.
+var allowedImageMIMEs = map[string]bool{
+	"image/jpeg": true,
+	"image/png":  true,
+	"image/gif":  true,
+	"image/webp": true,
+}
+
+// detectAndValidateMIME reads the first 512 bytes from the file to sniff the
+// content type, resets the reader, and returns an error if not an allowed image.
+func detectAndValidateMIME(f io.ReadSeeker) (string, error) {
+	buf := make([]byte, 512)
+	n, err := f.Read(buf)
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	mime := http.DetectContentType(buf[:n])
+	// DetectContentType may return "image/jpeg; charset=..." — strip params.
+	if idx := strings.Index(mime, ";"); idx != -1 {
+		mime = strings.TrimSpace(mime[:idx])
+	}
+	if !allowedImageMIMEs[mime] {
+		return "", fmt.Errorf("unsupported file type %q: only JPEG, PNG, GIF, WEBP are allowed", mime)
+	}
+	return mime, nil
+}
+
 func saveSingleImageLocal(fileHeader *multipart.FileHeader) (string, error) {
 	if err := os.MkdirAll(filepath.Join("media", "product_images"), 0o755); err != nil {
 		return "", err
@@ -1047,10 +1108,13 @@ func saveSingleImageLocal(fileHeader *multipart.FileHeader) (string, error) {
 	}
 	defer src.Close()
 
-	ext := strings.ToLower(filepath.Ext(fileHeader.Filename))
-	if ext == "" {
-		ext = ".jpg"
+	// Validate actual file content, not just extension.
+	detectedMIME, err := detectAndValidateMIME(src)
+	if err != nil {
+		return "", err
 	}
+
+	ext := mimeToExt(detectedMIME)
 
 	base := strings.TrimSuffix(filepath.Base(fileHeader.Filename), filepath.Ext(fileHeader.Filename))
 	safeBase := sanitizeFilename(base)
@@ -1072,6 +1136,19 @@ func saveSingleImageLocal(fileHeader *multipart.FileHeader) (string, error) {
 	}
 
 	return "/media/product_images/" + filename, nil
+}
+
+func mimeToExt(mime string) string {
+	switch mime {
+	case "image/png":
+		return ".png"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	default:
+		return ".jpg"
+	}
 }
 
 var (
@@ -1120,10 +1197,14 @@ func saveSingleImageToS3(fileHeader *multipart.FileHeader) (string, error) {
 	}
 	defer src.Close()
 
-	ext := strings.ToLower(filepath.Ext(fileHeader.Filename))
-	if ext == "" {
-		ext = ".jpg"
+	// Validate actual file content, not just extension or client-provided MIME.
+	detectedMIME, err := detectAndValidateMIME(src)
+	if err != nil {
+		return "", err
 	}
+
+	ext := mimeToExt(detectedMIME)
+	contentType := detectedMIME
 
 	base := strings.TrimSuffix(filepath.Base(fileHeader.Filename), filepath.Ext(fileHeader.Filename))
 	safeBase := sanitizeFilename(base)
@@ -1133,10 +1214,6 @@ func saveSingleImageToS3(fileHeader *multipart.FileHeader) (string, error) {
 
 	filename := fmt.Sprintf("%s_%d%s", safeBase, time.Now().UnixNano(), ext)
 	key := "media/product_images/" + filename
-	contentType := fileHeader.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
 
 	_, err = uploader.Upload(context.Background(), &s3.PutObjectInput{
 		Bucket:       &bucketName,

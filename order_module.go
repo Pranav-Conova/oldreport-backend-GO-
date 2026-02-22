@@ -686,7 +686,7 @@ func listOrders(ctx context.Context, repo *productRepository, userID *int64) ([]
 
 	orders := make([]OrderOut, 0)
 	orderIDs := make([]int64, 0)
-	orderMap := map[int64]*OrderOut{}
+	orderIndex := map[int64]int{}
 
 	for rows.Next() {
 		var o OrderOut
@@ -709,7 +709,7 @@ func listOrders(ctx context.Context, repo *productRepository, userID *int64) ([]
 		o.Items = []OrderItemOut{}
 		orders = append(orders, o)
 		orderIDs = append(orderIDs, o.ID)
-		orderMap[o.ID] = &orders[len(orders)-1]
+		orderIndex[o.ID] = len(orders) - 1
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -748,8 +748,8 @@ func listOrders(ctx context.Context, repo *productRepository, userID *int64) ([]
 			u := image.String
 			it.Image = &u
 		}
-		if ref, ok := orderMap[orderID]; ok {
-			ref.Items = append(ref.Items, it)
+		if idx, ok := orderIndex[orderID]; ok {
+			orders[idx].Items = append(orders[idx].Items, it)
 		}
 	}
 	if err := itemRows.Err(); err != nil {

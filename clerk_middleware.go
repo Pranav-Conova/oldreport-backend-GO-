@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,11 @@ import (
 	"github.com/MicahParks/keyfunc"
 	"github.com/golang-jwt/jwt/v4"
 )
+
+// contextKey is a private type preventing context key collisions with other packages.
+type contextKey string
+
+const clerkUserKey contextKey = "clerk_user"
 
 type ClerkUser struct {
 	ID        string    `json:"id"`
@@ -67,7 +73,7 @@ func ClerkMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		if auth == "" {
-			if isPublicProductsListRequest(r) {
+			if isPublicProductReadRequest(r) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -127,12 +133,12 @@ func ClerkMiddleware(next http.Handler) http.Handler {
 			logErrorWithTrace("failed to sync custom user for clerk_id="+user.ID, err)
 		}
 
-		ctx := context.WithValue(r.Context(), "clerk_user", user)
+		ctx := context.WithValue(r.Context(), clerkUserKey, user)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-func isPublicProductsListRequest(r *http.Request) bool {
+func isPublicProductReadRequest(r *http.Request) bool {
 	if r.Method != http.MethodGet {
 		return false
 	}
@@ -140,7 +146,28 @@ func isPublicProductsListRequest(r *http.Request) bool {
 	for strings.HasSuffix(path, "/") && len(path) > 1 {
 		path = strings.TrimSuffix(path, "/")
 	}
-	return path == "/api/products" || path == "/products"
+	if path == "/api/products" || path == "/products" {
+		return true
+	}
+
+	// Allow GET /api/products/{id} and GET /products/{id} without auth.
+	if strings.HasPrefix(path, "/api/products/") {
+		rawID := strings.TrimPrefix(path, "/api/products/")
+		if rawID == "" || strings.Contains(rawID, "/") {
+			return false
+		}
+		_, err := strconv.ParseInt(rawID, 10, 64)
+		return err == nil
+	}
+	if strings.HasPrefix(path, "/products/") {
+		rawID := strings.TrimPrefix(path, "/products/")
+		if rawID == "" || strings.Contains(rawID, "/") {
+			return false
+		}
+		_, err := strconv.ParseInt(rawID, 10, 64)
+		return err == nil
+	}
+	return false
 }
 
 func fetchClerkUser(userID string) (*ClerkUser, error) {
@@ -244,6 +271,6 @@ func clerkUserCacheTTL() time.Duration {
 
 // FromContext returns the Clerk user stored in context by ClerkMiddleware.
 func FromContext(ctx context.Context) (*ClerkUser, bool) {
-	u, ok := ctx.Value("clerk_user").(*ClerkUser)
+	u, ok := ctx.Value(clerkUserKey).(*ClerkUser)
 	return u, ok
 }
