@@ -1,0 +1,30 @@
+bin/
+vendor/
+*.exe
+*.log
+media/
+
+# Go build / test artifacts
+*.test
+*.out
+
+# Dependency directories
+Godeps/
+
+# IDEs and editors
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+
+# Environment files
+.env
+
+# Local DBs and runtime files
+*.db
+*.sqlite
+test.db
+
+# Logs
+*.log

@@ -11,6 +11,10 @@ Endpoints:
 - `GET /api/products/{id}` returns one product (including hidden)
 - `PUT /api/products/{id}` replaces stock details only
 - `DELETE /api/products/delete/{id}` soft-deletes a product (`show=false`)
+- `GET /api/cart` (or `/api/cart/`) returns authenticated user's cart
+- `POST /api/cart` adds an item to authenticated user's cart
+- `PUT /api/cart` updates quantity of an existing cart item
+- `DELETE /api/cart` removes an item from cart using `item_id`
 - `GET /role` (or `/role/`) returns authenticated user's `username`, `email`, `role`
 - `GET /address` (or `/address/`) returns authenticated user's address
 - `POST /address` creates/updates authenticated user's address
@@ -42,6 +46,9 @@ Notes:
 - Size choices: `S`, `M`, `L`, `XL`
 - Product write actions (`POST/PUT/DELETE`) require authenticated user role `manager`
 - On authenticated requests, Clerk middleware auto-syncs user into `custom_users` if missing
+- Cart endpoints require authentication
+- Cart `POST`/`PUT`/`DELETE` expect a JSON request body; invalid JSON returns:
+  `{"error":"Invalid JSON body."}`
 Database:
 
 - `DB_BACKEND=sqlite` for testing (default), using `SQLITE_PATH=test.db`
