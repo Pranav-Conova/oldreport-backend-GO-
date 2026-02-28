@@ -30,6 +30,8 @@ type OrderOut struct {
 	User            string         `json:"user,omitempty"`
 	Phone           string         `json:"phone,omitempty"`
 	TotalAmount     int64          `json:"total_amount"`
+	DiscountAmount  int64          `json:"discount_amount"`
+	CouponCode      *string        `json:"coupon_code,omitempty"`
 	DeliveryStatus  string         `json:"delivery_status"`
 	ConsignNumber   string         `json:"consignment_number,omitempty"`
 	RazorpayOrderID string         `json:"razorpay_order_id,omitempty"`
@@ -89,7 +91,7 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	amount, err := parseAmountField(r)
+	amount, couponCode, err := parseAmountAndCoupon(r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid amount"})
 		return
@@ -114,7 +116,28 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	totalAmountINR := calcCartTotalINR(items)
-	if amount != int64(totalAmountINR) {
+
+	// ── Coupon handling (optional) ────────────────────────────────────────
+	var discountINR float64
+	if couponCode != "" {
+		cResp, cErr := validateAndCalcDiscount(r.Context(), repo, couponCode, float64(totalAmountINR), user.ID)
+		if cErr != nil {
+			logErrorWithTrace("coupon validation error", cErr)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to validate coupon"})
+			return
+		}
+		if !cResp.Valid {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": cResp.Message})
+			return
+		}
+		discountINR = cResp.DiscountAmount
+	}
+
+	expectedTotal := int64(totalAmountINR) - int64(discountINR)
+	if expectedTotal < 1 {
+		expectedTotal = 1
+	}
+	if amount != expectedTotal {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid amount"})
 		return
 	}
@@ -258,18 +281,42 @@ func verifyPaymentHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// ── Coupon re-validation inside transaction ─────────────────────────
+	couponCode := parseCouponCodeFromPayload(payload)
+	var couponIDPtr *int64
+	var discountPaisa int64
+	if couponCode != "" {
+		cartTotalINR := float64(calcCartTotalINR(items))
+		cID, dPaisa, errMsg, cErr := validateCouponInTx(r.Context(), tx, repo.dialect, couponCode, cartTotalINR, user.ID)
+		if cErr != nil {
+			logErrorWithTrace("coupon re-validation failed", cErr)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to validate coupon"})
+			return
+		}
+		if errMsg != "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": errMsg})
+			return
+		}
+		couponIDPtr = &cID
+		discountPaisa = dPaisa
+		totalPaisa = totalPaisa - discountPaisa
+		if totalPaisa < 100 { // minimum 1 INR in paisa
+			totalPaisa = 100
+		}
+	}
+
 	var orderID int64
 	insertOrder := `
-		INSERT INTO orders(user_id, address_id, razorpay_order_id, razorpay_payment_id, razorpay_signature, total_amount, delivery_status)
-		VALUES(?, ?, ?, ?, ?, ?, 'pending')`
+		INSERT INTO orders(user_id, address_id, coupon_id, discount_amount, razorpay_order_id, razorpay_payment_id, razorpay_signature, total_amount, delivery_status)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
 	if repo.dialect == "postgres" {
-		if err := tx.QueryRowContext(r.Context(), rebindQuery(insertOrder+` RETURNING id`, repo.dialect), user.ID, address.ID, payload.OrderID, payload.PaymentID, payload.Signature, totalPaisa).Scan(&orderID); err != nil {
+		if err := tx.QueryRowContext(r.Context(), rebindQuery(insertOrder+` RETURNING id`, repo.dialect), user.ID, address.ID, couponIDPtr, discountPaisa, payload.OrderID, payload.PaymentID, payload.Signature, totalPaisa).Scan(&orderID); err != nil {
 			logErrorWithTrace("failed to create order", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create order"})
 			return
 		}
 	} else {
-		res, err := tx.ExecContext(r.Context(), rebindQuery(insertOrder, repo.dialect), user.ID, address.ID, payload.OrderID, payload.PaymentID, payload.Signature, totalPaisa)
+		res, err := tx.ExecContext(r.Context(), rebindQuery(insertOrder, repo.dialect), user.ID, address.ID, couponIDPtr, discountPaisa, payload.OrderID, payload.PaymentID, payload.Signature, totalPaisa)
 		if err != nil {
 			logErrorWithTrace("failed to create order", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create order"})
@@ -301,6 +348,22 @@ func verifyPaymentHandler(w http.ResponseWriter, r *http.Request) {
 		logErrorWithTrace("failed to clear cart", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to clear cart"})
 		return
+	}
+
+	// ── Record coupon usage & increment counter ─────────────────────────
+	if couponIDPtr != nil {
+		if _, err := tx.ExecContext(r.Context(), rebindQuery(`
+			INSERT INTO coupon_usages(coupon_id, user_id, order_id) VALUES(?, ?, ?)`, repo.dialect), *couponIDPtr, user.ID, orderID); err != nil {
+			logErrorWithTrace("failed to record coupon usage", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to record coupon usage"})
+			return
+		}
+		if _, err := tx.ExecContext(r.Context(), rebindQuery(`
+			UPDATE coupons SET times_used = times_used + 1 WHERE id = ?`, repo.dialect), *couponIDPtr); err != nil {
+			logErrorWithTrace("failed to update coupon usage count", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update coupon usage"})
+			return
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -539,9 +602,10 @@ func verifyRazorpaySignature(orderID, paymentID, signature string) bool {
 }
 
 type paymentVerifyPayload struct {
-	OrderID   string
-	PaymentID string
-	Signature string
+	OrderID    string
+	PaymentID  string
+	Signature  string
+	CouponCode string
 }
 
 func parsePaymentVerifyPayload(r *http.Request) (paymentVerifyPayload, error) {
@@ -550,9 +614,10 @@ func parsePaymentVerifyPayload(r *http.Request) (paymentVerifyPayload, error) {
 		return paymentVerifyPayload{}, err
 	}
 	return paymentVerifyPayload{
-		OrderID:   strings.TrimSpace(m["razorpay_order_id"]),
-		PaymentID: strings.TrimSpace(m["razorpay_payment_id"]),
-		Signature: strings.TrimSpace(m["razorpay_signature"]),
+		OrderID:    strings.TrimSpace(m["razorpay_order_id"]),
+		PaymentID:  strings.TrimSpace(m["razorpay_payment_id"]),
+		Signature:  strings.TrimSpace(m["razorpay_signature"]),
+		CouponCode: strings.ToUpper(strings.TrimSpace(m["coupon_code"])),
 	}, nil
 }
 
@@ -589,6 +654,37 @@ func parseAmountField(r *http.Request) (int64, error) {
 		return 0, err
 	}
 	return int64(math.Round(f)), nil
+}
+
+// parseAmountAndCoupon parses both amount and optional coupon_code from the
+// request body in a single pass (since parseAnyBody consumes the body).
+func parseAmountAndCoupon(r *http.Request) (int64, string, error) {
+	m, err := parseAnyBody(r)
+	if err != nil {
+		return 0, "", err
+	}
+	raw := strings.TrimSpace(m["amount"])
+	if raw == "" {
+		return 0, "", errors.New("missing amount")
+	}
+	var amount int64
+	if i, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		amount = i
+	} else {
+		f, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return 0, "", err
+		}
+		amount = int64(math.Round(f))
+	}
+	couponCode := strings.ToUpper(strings.TrimSpace(m["coupon_code"]))
+	return amount, couponCode, nil
+}
+
+// parseCouponCodeFromPayload extracts the coupon_code field from the verify
+// payment payload.
+func parseCouponCodeFromPayload(p paymentVerifyPayload) string {
+	return p.CouponCode
 }
 
 func parseAnyBody(r *http.Request) (map[string]string, error) {
@@ -666,11 +762,13 @@ func listOrders(ctx context.Context, repo *productRepository, userID *int64) ([]
 	query := `
 		SELECT o.id, o.user_id, COALESCE(u.email, ''), COALESCE(a.first_name, ''), COALESCE(a.last_name, ''), COALESCE(a.address_line1, ''),
 		       COALESCE(a.street, ''), COALESCE(a.city, ''), COALESCE(a.state, ''), COALESCE(a.postal_code, ''), COALESCE(a.phone_number, ''),
-		       COALESCE(o.total_amount, 0), COALESCE(o.delivery_status, 'pending'), COALESCE(o.consignment_number, ''),
+		       COALESCE(o.total_amount, 0), COALESCE(o.discount_amount, 0), c.code,
+		       COALESCE(o.delivery_status, 'pending'), COALESCE(o.consignment_number, ''),
 		       COALESCE(o.razorpay_order_id, ''), COALESCE(o.razorpay_payment_id, ''), o.created_at
 		FROM orders o
 		LEFT JOIN custom_users u ON u.id = o.user_id
-		LEFT JOIN addresses a ON a.id = o.address_id`
+		LEFT JOIN addresses a ON a.id = o.address_id
+		LEFT JOIN coupons c ON c.id = o.coupon_id`
 	args := []any{}
 	if userID != nil {
 		query += ` WHERE o.user_id = ?`
@@ -692,8 +790,13 @@ func listOrders(ctx context.Context, repo *productRepository, userID *int64) ([]
 		var o OrderOut
 		var uid int64
 		var first, last, line1, street, city, state, postal, phone string
-		if err := rows.Scan(&o.ID, &uid, &o.User, &first, &last, &line1, &street, &city, &state, &postal, &phone, &o.TotalAmount, &o.DeliveryStatus, &o.ConsignNumber, &o.RazorpayOrderID, &o.RazorpayPayment, &o.CreatedAt); err != nil {
+		var couponCode sql.NullString
+		if err := rows.Scan(&o.ID, &uid, &o.User, &first, &last, &line1, &street, &city, &state, &postal, &phone, &o.TotalAmount, &o.DiscountAmount, &couponCode, &o.DeliveryStatus, &o.ConsignNumber, &o.RazorpayOrderID, &o.RazorpayPayment, &o.CreatedAt); err != nil {
 			return nil, err
+		}
+		if couponCode.Valid && couponCode.String != "" {
+			s := couponCode.String
+			o.CouponCode = &s
 		}
 		o.Phone = phone
 		o.Address = map[string]any{

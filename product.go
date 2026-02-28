@@ -344,10 +344,26 @@ func (r *productRepository) migrate() error {
 			);`,
 			`CREATE INDEX IF NOT EXISTS idx_cart_items_cart_id ON cart_items(cart_id);`,
 			`CREATE INDEX IF NOT EXISTS idx_cart_items_product_size ON cart_items(product_id, size);`,
+			`CREATE TABLE IF NOT EXISTS coupons (
+				id BIGSERIAL PRIMARY KEY,
+				code TEXT NOT NULL UNIQUE,
+				discount_type TEXT NOT NULL DEFAULT 'flat',
+				discount_value DOUBLE PRECISION NOT NULL DEFAULT 0,
+				max_discount_cap DOUBLE PRECISION,
+				min_order_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+				max_order_amount DOUBLE PRECISION,
+				max_uses INTEGER NOT NULL DEFAULT 0,
+				max_uses_per_user INTEGER NOT NULL DEFAULT 0,
+				times_used INTEGER NOT NULL DEFAULT 0,
+				is_active INTEGER NOT NULL DEFAULT 1,
+				created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			);`,
 			`CREATE TABLE IF NOT EXISTS orders (
 				id BIGSERIAL PRIMARY KEY,
 				user_id BIGINT NOT NULL REFERENCES custom_users(id) ON DELETE CASCADE,
 				address_id BIGINT REFERENCES addresses(id) ON DELETE SET NULL,
+				coupon_id BIGINT REFERENCES coupons(id) ON DELETE SET NULL,
+				discount_amount BIGINT NOT NULL DEFAULT 0,
 				razorpay_order_id TEXT,
 				razorpay_payment_id TEXT,
 				razorpay_signature TEXT,
@@ -364,8 +380,17 @@ func (r *productRepository) migrate() error {
 				quantity INTEGER,
 				price BIGINT
 			);`,
+			`CREATE TABLE IF NOT EXISTS coupon_usages (
+				id BIGSERIAL PRIMARY KEY,
+				coupon_id BIGINT NOT NULL REFERENCES coupons(id) ON DELETE CASCADE,
+				user_id BIGINT NOT NULL REFERENCES custom_users(id) ON DELETE CASCADE,
+				order_id BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+				created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+				UNIQUE(coupon_id, order_id)
+			);`,
 			`CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at DESC);`,
 			`CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id);`,
+			`CREATE INDEX IF NOT EXISTS idx_coupon_usages_coupon_user ON coupon_usages(coupon_id, user_id);`,
 		}
 	} else {
 		queries = []string{
@@ -437,10 +462,26 @@ func (r *productRepository) migrate() error {
 			);`,
 			`CREATE INDEX IF NOT EXISTS idx_cart_items_cart_id ON cart_items(cart_id);`,
 			`CREATE INDEX IF NOT EXISTS idx_cart_items_product_size ON cart_items(product_id, size);`,
+			`CREATE TABLE IF NOT EXISTS coupons (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				code TEXT NOT NULL UNIQUE,
+				discount_type TEXT NOT NULL DEFAULT 'flat',
+				discount_value REAL NOT NULL DEFAULT 0,
+				max_discount_cap REAL,
+				min_order_amount REAL NOT NULL DEFAULT 0,
+				max_order_amount REAL,
+				max_uses INTEGER NOT NULL DEFAULT 0,
+				max_uses_per_user INTEGER NOT NULL DEFAULT 0,
+				times_used INTEGER NOT NULL DEFAULT 0,
+				is_active INTEGER NOT NULL DEFAULT 1,
+				created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+			);`,
 			`CREATE TABLE IF NOT EXISTS orders (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				user_id INTEGER NOT NULL,
 				address_id INTEGER,
+				coupon_id INTEGER,
+				discount_amount INTEGER NOT NULL DEFAULT 0,
 				razorpay_order_id TEXT,
 				razorpay_payment_id TEXT,
 				razorpay_signature TEXT,
@@ -449,7 +490,8 @@ func (r *productRepository) migrate() error {
 				delivery_status TEXT NOT NULL DEFAULT 'pending',
 				created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 				FOREIGN KEY(user_id) REFERENCES custom_users(id) ON DELETE CASCADE,
-				FOREIGN KEY(address_id) REFERENCES addresses(id) ON DELETE SET NULL
+				FOREIGN KEY(address_id) REFERENCES addresses(id) ON DELETE SET NULL,
+				FOREIGN KEY(coupon_id) REFERENCES coupons(id) ON DELETE SET NULL
 			);`,
 			`CREATE TABLE IF NOT EXISTS order_items (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -461,8 +503,20 @@ func (r *productRepository) migrate() error {
 				FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
 				FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE SET NULL
 			);`,
+			`CREATE TABLE IF NOT EXISTS coupon_usages (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				coupon_id INTEGER NOT NULL,
+				user_id INTEGER NOT NULL,
+				order_id INTEGER NOT NULL,
+				created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				UNIQUE(coupon_id, order_id),
+				FOREIGN KEY(coupon_id) REFERENCES coupons(id) ON DELETE CASCADE,
+				FOREIGN KEY(user_id) REFERENCES custom_users(id) ON DELETE CASCADE,
+				FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
+			);`,
 			`CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at DESC);`,
 			`CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id);`,
+			`CREATE INDEX IF NOT EXISTS idx_coupon_usages_coupon_user ON coupon_usages(coupon_id, user_id);`,
 		}
 	}
 

@@ -119,6 +119,7 @@ func main() {
 	registerAPIRoutes(mux)
 	registerCartRoutes(mux)
 	registerOrderRoutes(mux)
+	registerCouponRoutes(mux)
 
 	handler := panicRecovery(requestLogger(trace404Middleware(corsMiddleware(bodyLimitMiddleware(mux)))))
 
