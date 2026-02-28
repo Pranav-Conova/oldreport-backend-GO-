@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,7 +22,8 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
 
@@ -75,18 +77,15 @@ var (
 // where warm instances may wake up with a stale pool after minutes of
 // inactivity — sync.Once would permanently return the broken connection.
 func getProductRepository() (*productRepository, error) {
-	// Fast path: connection exists and is healthy.
+	// Fast path: connection exists — return it immediately.
+	// database/sql handles dead connections transparently via ConnMaxLifetime
+	// and automatic retry, so pinging on every call is unnecessary and wastes
+	// connection-pool slots (especially critical on Lambda where MaxOpenConns=2).
 	repoMu.RLock()
 	inst := repoInst
 	repoMu.RUnlock()
 	if inst != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		if err := inst.db.PingContext(ctx); err == nil {
-			return inst, nil
-		}
-		// Ping failed — fall through to reconnect.
-		log.Printf("[db] ping failed on warm connection, reconnecting")
+		return inst, nil
 	}
 
 	// Slow path: (re)connect under write lock.
@@ -108,7 +107,12 @@ func getProductRepository() (*productRepository, error) {
 	if err != nil {
 		return nil, err
 	}
-	db, err := sql.Open(driver, dsn)
+	var db *sql.DB
+	if driver == "pgx" {
+		db, err = openPostgresDB(dsn)
+	} else {
+		db, err = sql.Open(driver, dsn)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +187,54 @@ func isLambda() bool {
 	return os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != ""
 }
 
+// openPostgresDB opens a *sql.DB using pgx with IPv4-only DNS + dialer.
+//
+// AWS Lambda does not support IPv6 sockets. pgx resolves the hostname to IP
+// addresses before calling DialFunc, so even a tcp4 dialer still receives the
+// IPv6 string and fails with "no suitable address found".  The LookupFunc
+// below filters out all IPv6 results at the DNS stage so pgx only ever sees
+// IPv4 addresses, and the tcp4 DialFunc ensures the socket family matches.
+func openPostgresDB(dsn string) (*sql.DB, error) {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("pgx parse config: %w", err)
+	}
+
+	// Supabase pgBouncer (port 6543) runs in transaction pooling mode, which
+	// does NOT support server-side prepared statements.  pgx v5 defaults to
+	// QueryExecModeExtendedCache which sends Parse messages (prepared stmts) —
+	// pgBouncer rejects them, causing every query to fail.
+	// Simple protocol uses plain text queries with no server-side state, which
+	// is fully compatible with pgBouncer transaction mode.
+	cfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+
+	// Step 1 – strip IPv6 from DNS results so pgx never attempts to dial one.
+	cfg.LookupFunc = func(ctx context.Context, host string) ([]string, error) {
+		addrs, err := net.DefaultResolver.LookupHost(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		var ipv4 []string
+		for _, a := range addrs {
+			if ip := net.ParseIP(a); ip != nil && ip.To4() != nil {
+				ipv4 = append(ipv4, a)
+			}
+		}
+		if len(ipv4) == 0 {
+			return nil, fmt.Errorf("host %s resolved to no IPv4 addresses (Lambda requires IPv4)", host)
+		}
+		return ipv4, nil
+	}
+
+	// Step 2 – belt-and-suspenders: force tcp4 socket so the OS never
+	// upgrades to IPv6 even if a future pgx version changes how it passes addrs.
+	cfg.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp4", addr)
+	}
+
+	return stdlib.OpenDB(*cfg), nil
+}
+
 func resolveDBConfig() (driver string, dsn string, dialect string, err error) {
 	backend := strings.ToLower(strings.TrimSpace(os.Getenv("DB_BACKEND")))
 	if backend == "" {
@@ -197,6 +249,13 @@ func resolveDBConfig() (driver string, dsn string, dialect string, err error) {
 		}
 		return "sqlite", dbPath, "sqlite", nil
 	case "postgres", "postgresql":
+		// On Lambda, prefer the pgBouncer pooler URL (port 6543, IPv4,
+		// transaction-mode pooling).  Fall back to DATABASE_URL for local dev.
+		if isLambda() {
+			if pooler := strings.TrimSpace(os.Getenv("SUPABASE_POOLER_URL")); pooler != "" {
+				return "pgx", pooler, "postgres", nil
+			}
+		}
 		if url := strings.TrimSpace(os.Getenv("DATABASE_URL")); url != "" {
 			return "pgx", url, "postgres", nil
 		}

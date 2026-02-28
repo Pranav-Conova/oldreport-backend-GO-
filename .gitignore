@@ -28,3 +28,7 @@ test.db
 
 # Logs
 *.log
+
+# dist and build directories
+dist/
+build/
